@@ -1,5 +1,6 @@
 #!/bin/bash
 set -o pipefail
+set +o histexpand
 
 # TAPE BACKUP TOOL - TOCTAR
 
@@ -178,7 +179,7 @@ function set_device {
 
     # Use (first) tape if no tar file/device specified
     if [[ -z "$TAR_FILE" ]]; then
-        echo "Using default tape device" >&2
+        echo "# Using default tape device" >&2
         TAR_FILE=$default_tape
         # Set IS_TAPE to check -c below, to not create a regular file nst0!
         IS_TAPE=1
@@ -499,11 +500,20 @@ function extract_toc_file {
         # Default tar tape blocks are 20*512 = 10K.
         # There's iflag=fullblock, but it doesn't help with the count thing.
         # Anyway... First, we'll read a bit more than we need.
-        dd ibs=$bs count=$in_count if="$TAR_FILE" of="$tmp_file" || return $?
-        # TODO capture and print in verbose mode only (VERBOSE ...)
+        local dd_out
+        dd_out=$(dd ibs=$bs count=$in_count if="$TAR_FILE" of="$tmp_file" 2>&1)
+        if [[ $? -ne 0 ]]; then
+            echo "$dd_out" >&2
+            return 1
+        fi
 
         # Now copy TOC from temporary file to target file
-        dd ibs=512 skip=1 count="$toc_count" if="$tmp_file" of="$toc_file" || return $?
+        dd_out=$(dd ibs=512 skip=1 count="$toc_count" if="$tmp_file" of="$toc_file" 2>&1)
+        if [[ $? -ne 0 ]]; then
+            echo "$dd_out" >&2
+            return 1
+        fi
+
         # Double-check size (if < count*bs)
         local read_bytes=$(stat --printf "%s" "$toc_file")
         if [[ $read_bytes -ne $TOC_FIX_SIZE ]]; then
@@ -578,7 +588,12 @@ function replace_toc {
     rewind $TAPE_FILE_INDEX || return $?
 
     # Now copy TOC from source file into temporary file (after header)
-    dd obs=512 seek=1 conv=notrunc if="$toc_file" of="$tmp_section_file" || return $?
+    local dd_out
+    dd_out=$(dd obs=512 seek=1 conv=notrunc if="$toc_file" of="$tmp_section_file" 2>&1)
+    if [[ $? -ne 0 ]]; then
+        echo "$dd_out" >&2
+        return 1
+    fi
 
     # Write updated TOC section to archive, overwriting it from the beginning
     # The TOC section is slightly larger than the TOC itself (buffer, bs).
@@ -587,8 +602,9 @@ function replace_toc {
     # It also contains a tar header of 512B which we're overwriting,
     # but we've just read/extracted that header from the archive,
     # so we're effectively not changing it.
-    dd obs=$bs conv=notrunc if="$tmp_section_file" of="$TAR_FILE"
-    if [ $? -ne 0 ]; then
+    dd_out=$(dd obs=$bs conv=notrunc if="$tmp_section_file" of="$TAR_FILE" 2>&1)
+    if [[ $? -ne 0 ]]; then
+        echo "$dd_out" >&2
         echo "ERROR - failed to overwrite TOC section - archive may be damaged" >&2
         return 2
     fi
@@ -691,7 +707,7 @@ function gen_script {
             }
             # Read TOC entry with TOC section
             next unless $in_toc_section;
-            my ($toc_hash, $toc_size, $toc_mtime, $toc_filename) = $row =~ /^(\w+)\s+(\w+)\s+(\w+)\s+(.+)\s*$/;
+            my ($toc_hash, $toc_size, $toc_mtime, $toc_filename) = $row =~ /^(\w+)\s+(\w+)\s+(\w+)\s+(.+)$/;
             if (!length($toc_filename)) {
                 warn "### FAILED TO PARSE TOC line: $row";
                 next;
@@ -764,6 +780,49 @@ END
     echo "$file"
 }
 
+# Read TOC file and extract TOC section lines (without header, footer)
+# TODO if requested, return single section only
+function toc_lines {
+    local toc_file=$1
+
+    local in_toc_section=0
+    while IFS= read -r line; do
+        # Skip over header, footer lines
+        [[ "$line" =~ ^\s*$ ]] && continue
+        # Check for TOC header
+        if ! (( $in_toc_section )); then
+            if [[ "$line" =~ ^#\ TOC ]]; then
+                in_toc_section=1
+                continue
+            fi
+        else
+            # Exclamation marks are funny: set +o histexpand
+            if [[ "$line" =~ ^#!TOC ]]; then
+                in_toc_section=0
+                continue
+            fi
+        fi
+        # Read TOC entry with TOC section
+        (( $in_toc_section )) || continue
+        echo "$line"
+
+    done <"$toc_file"
+}
+
+# Read TOC file and extract file list, one in each line
+# TODO alternating toc formats (columns)? => Perl parser
+function toc_file_list {
+    local toc_file=$1
+    local toc_lines
+    toc_lines=$(toc_lines "$toc_file")
+
+    while IFS= read -r line; do
+        echo "$line" | perl -ne '/^[a-zA-Z0-9]+\s+[a-zA-Z0-9]+\s+[a-zA-Z0-9]+\s+(.+)$/ && print $1'
+        echo
+
+    done <<<"$toc_lines"
+}
+
 ################################################################################
 
 # Most info, warn and debug messages are sent to stderr by default.
@@ -781,14 +840,13 @@ if [[ $cmd == "create" || $cmd == "append" ]]; then
         exit 2
     fi
 
-    # TODO append is EXPERIMENTAL / UNFINISHED
     # TODO append to same archive... ask for last tape, then append ...
     # fsfm or similar to not create another tape file
 
     # Say something and confirm
     echo "### CREATING TARBALL BACKUP => ${TAR_NAME}..." >&2
-    echo "### THIS WILL OVERWRITE THE TAPE ARCHIVE AT ${TAR_FILE}#$TAPE_FILE_INDEX..." >&2
-    ask "Please insert the [first] drive and confirm (hit Ctrl+C or type N to abort)" || exit $?
+    echo "### THIS WILL OVERWRITE THE TAPE ARCHIVE AT ${TAR_FILE} [#$TAPE_FILE_INDEX] ..." >&2
+    ask "Please insert the [first] drive and confirm (hit Ctrl+C or type N to abort)" || exit 2
 
     # Prepare TOC file (fixed name)
     # In append mode, rewind first to read the OLD TOC
@@ -831,27 +889,24 @@ if [[ $cmd == "create" || $cmd == "append" ]]; then
         # The first tape must be inserted, which is the case, see above.
         replace_toc "$toc_file" || exit $?
         # Tell Tar to update the archive # TODO
-        args+=("-u")
+        args+=("--append")
 
-        # TODO what about multi-volume tape archives? query_first()??
-        # TODO I don't know how we could write a copy of the TOC to EACH VOLUME
         # Ask for last tape
+        # TODO wouldn't it be great if tar would check for the last tape
+        # TODO if is_multi ...
         if [[ $IS_TAPE -eq 1 ]]; then
-            echo "TODO need last tape for append mode" >&2
-            exit 7
-        fi
-        # Ask for the LAST tape to append there # TODO
-        # Move (last) tape forward, to the end of the archive, first tape file
-        ask "Please insert the LAST tape"
-        if [ $? -ne 0 ]; then
-            echo "NOTE: The archive is in an inconsistent state." 2>&2
-            echo "The TOC has already been updated but no new files have been appended to the archive." 2>&2
-            ask "Are you sure you want to abort? Press Y to abort" && exit $?
+            ask "Please insert the LAST tape and confirm"
+            if [ $? -ne 0 ]; then
+                echo "NOTE: The archive is in an inconsistent state." 2>&2
+                echo "The TOC has already been updated but no new files have been appended to the archive." 2>&2
+                ask "Are you sure you want to abort? Press Y to abort" && exit $?
+            fi
         fi
         # Move tape to the end of the [first] tape file
+        # $MT -f "$TAR_FILE" fsfm 0
+        # /dev/nst0: Input/output error
         if [[ $IS_TAPE -eq 1 ]]; then
             rewind $TAPE_FILE_INDEX || exit $?
-            $MT "$TAR_FILE" fsfm 0 || exit $?
         fi
     fi
 
@@ -870,8 +925,13 @@ if [[ $cmd == "create" || $cmd == "append" ]]; then
     tar "${args[@]}"
     if (( $? || ${PIPESTATUS[0]} )); then
         echo "ERROR - failed to write archive; possibly incomplete: $TAR_FILE" >&2
-        exit 2
+        exit 3
     fi
+    #if [[ $cmd == "create" ]]; then
+    #    if [[ $IS_TAPE -eq 1 ]]; then
+    #        $MT -f "$TAR_FILE" eof || exit $?
+    #    fi
+    #fi
 
 elif [[ $cmd == "toc" ]]; then
     # Extract and print TOC
@@ -922,6 +982,20 @@ elif [[ $cmd == "bs" ]]; then
     else
         echo "### BLOCK SIZE DETERMINED TO BE $bs_k KB ($bs)" >&2
     fi
+
+elif [[ $cmd == "list" ]]; then
+    # Load TOC and print file list
+
+    tmp_toc_file=$(tmp_file)
+    if [[ $? -ne 0 ]]; then
+        echo "### FAILED TO CREATE TEMP FILE." >&2
+        exit 1
+    fi
+    if ! extract_toc_file "$tmp_toc_file"; then
+        echo "### FAILED TO READ TOC, CANNOT VERIFY." >&2
+        exit 1
+    fi
+    toc_file_list "$tmp_toc_file"
 
 elif [[ $cmd == "compare" ]]; then
     # Compare local files with their copies on tape
