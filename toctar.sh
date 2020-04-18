@@ -125,11 +125,6 @@ while [[ $# -gt 0 ]]; do
             IS_MULTI=0
             ;;
         # TODO -- stop parsing -> -C d1 f1 -C d2 f2 ...
-        #-C|--directory)
-        #    ...=$2
-        #    list+=(...)
-        #    shift
-        #    ;;
         -C|--directory)
             parent_dir_entry="${#ITEMS[@]};$2"
             REL_DIRS+=("$parent_dir_entry")
@@ -554,6 +549,14 @@ function extract_toc_file {
 
 # Replaces the TOC of an existing archive
 # The TOC is on the first tape (on a multi-volume archive)
+# This TOC area must be overwritten without truncating the archive
+# TODO THIS MAY DAMAGE THE TAPE ARCHIVE BY WRITING A FILEMARK AFTER 132M
+# It seems like the filemark is always written at the current position
+# when the file handle is closed. And after replacing/updating the TOC,
+# the tape is positioned after the TOC area, not at the end of the tar archive.
+# Calling mt to move the tape forward (to the end of the tape file)
+# isn't possible either while this program still holds an open file handle:
+# /dev/nst0: Device or resource busy
 function replace_toc {
     local toc_file=$1 # new TOC (source)
 
@@ -603,6 +606,7 @@ function replace_toc {
     # but we've just read/extracted that header from the archive,
     # so we're effectively not changing it.
     dd_out=$(dd obs=$bs conv=notrunc if="$tmp_section_file" of="$TAR_FILE" 2>&1)
+echo "tmp_section_file=$tmp_section_file ($dd_out) " >&2
     if [[ $? -ne 0 ]]; then
         echo "$dd_out" >&2
         echo "ERROR - failed to overwrite TOC section - archive may be damaged" >&2
@@ -888,7 +892,7 @@ if [[ $cmd == "create" || $cmd == "append" ]]; then
         # of the archive to replace it with an extended version.
         # The first tape must be inserted, which is the case, see above.
         replace_toc "$toc_file" || exit $?
-        # Tell Tar to update the archive # TODO
+        # Tell Tar to update the archive
         args+=("--append")
 
         # Ask for last tape
