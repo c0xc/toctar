@@ -92,12 +92,13 @@ shift
 
 # Options and arguments
 IS_TAPE=0
+KEEP_TEMP_DIR=0
 TAR_FILE=
-IS_MULTI=1
+IS_MULTI=0 # TODO
 ITEMS=()
 REL_DIRS=()
 IS_AUTO_DETECT_BS=1
-KEEP_TEMP_DIR=0
+CHECK_EXISTING=1
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --debug)
@@ -136,6 +137,9 @@ while [[ $# -gt 0 ]]; do
         --no-auto-detect-bs)
             IS_AUTO_DETECT_BS=0
             ;;
+        --no-check-existing)
+            CHECK_EXISTING=0
+            ;;
         --keep-temp-dir)
             KEEP_TEMP_DIR=1
             ;;
@@ -171,10 +175,11 @@ function set_device {
     # Tape defaults
     local drive_index=0
     local default_tape=/dev/nst${drive_index}
+    # TODO /dev/tape
 
     # Use (first) tape if no tar file/device specified
     if [[ -z "$TAR_FILE" ]]; then
-        echo "# Using default tape device" >&2
+        echo "# Using default tape device: $default_tape" >&2
         TAR_FILE=$default_tape
         # Set IS_TAPE to check -c below, to not create a regular file nst0!
         IS_TAPE=1
@@ -850,7 +855,19 @@ if [[ $cmd == "create" || $cmd == "append" ]]; then
     # Say something and confirm
     echo "### CREATING TARBALL BACKUP => ${TAR_NAME}..." >&2
     echo "### THIS WILL OVERWRITE THE TAPE ARCHIVE AT ${TAR_FILE} [#$TAPE_FILE_INDEX] ..." >&2
-    ask "Please insert the [first] drive and confirm (hit Ctrl+C or type N to abort)" || exit 2
+    if [[ $IS_MULTI -eq 1 ]]; then
+        ask "Please insert the [first] drive and confirm (hit Ctrl+C or type N to abort)" || exit 2
+    fi
+
+    # Check for existing archive that would be overwritten
+    if (( $CHECK_EXISTING )); then
+        tmp_toc_file=$(tmp_file)
+        if extract_toc_file "$tmp_toc_file" 2>/dev/null 1>&2; then
+            echo "# TAR ARCHIVE HEADER DETECTED IN CURRENT TAPE FILE..." >&2
+            ask "Really continue, overwriting previous contents?" || exit 2
+
+        fi
+    fi
 
     # Prepare TOC file (fixed name)
     # In append mode, rewind first to read the OLD TOC
@@ -881,6 +898,7 @@ if [[ $cmd == "create" || $cmd == "append" ]]; then
     args+=("-b" "$TAR_FACTOR")
     args+=("-f" "$TAR_FILE")
     args+=("-v")
+    [[ $IS_MULTI -eq 1 ]] && args+=("--multi-volume")
     if [[ $cmd == "create" ]]; then
         # Specify TOC as first file in the new archive
         args+=("-c" "-C" "$TMP_DIR" "${toc_file##*/}")
@@ -956,7 +974,9 @@ elif [[ $cmd == "detect" ]]; then
     # Detect TOCTAR tape archive by scanning TOC
     echo "### READING TOC / DETECTING TOCTAR ARCHIVE <= ${TAR_NAME}..." >&2
     tmp_toc_file=$(tmp_file)
-    ask "Please insert the [first] drive" || exit $?
+    if [[ $IS_MULTI -eq 1 ]]; then
+        ask "Please insert the [first] drive" || exit $?
+    fi
 
     # Try to read TOC
     # If it fails (TOC area does not contain TOC), it's not a TOCTAR archive
@@ -1024,9 +1044,17 @@ elif [[ $cmd == "verify" ]]; then
     # Rewind tape (again)
     rewind $TAPE_FILE_INDEX || exit $?
 
+    # Tar arguments
+    args=()
+    args+=("-b" "$TAR_FACTOR")
+    args+=("-f" "$TAR_FILE")
+    [[ $IS_MULTI -eq 1 ]] && args+=("--multi-volume")
+    args+=("-x")
+    args+=("--to-command=$script")
+
     # Run tar with custom verification script
     script=$(gen_script "$tmp_toc_file") || exit $?
-    tar x --to-command="$script" -b "$TAR_FACTOR" -f "$TAR_FILE"
+    tar "${args[@]}"
 
 elif [[ $cmd == "extract" ]]; then
     # Extract tape archive verifying each file in the process
