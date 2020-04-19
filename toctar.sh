@@ -297,7 +297,12 @@ function create_toc_file {
             item_items=$item
         elif [[ -d "$path" ]]; then
             # Scan dir recursively to add all files to TOC
-            item_items=$(find "$path" -mindepth 1 -type f -exec realpath --relative-to "$cwd_now" {} \;)
+            # Results in relative path arguments are prefixed accordingly
+            if [[ -z "$cwd_now" ]]; then
+                item_items=$(find "$path" -mindepth 1 -type f)
+            else
+                item_items=$(find "$path" -mindepth 1 -type f -exec realpath --relative-to "$cwd_now" {} \;)
+            fi
             if (( $? || ${PIPESTATUS[0]} )); then
                 echo "ERROR - failed to scan directory: $path" >&2
                 return 2
@@ -308,7 +313,13 @@ function create_toc_file {
 
         while IFS= read -r file; do
             # again, path is the full path, file is relative to tar
+            # Prepend base path (if specified)
             path="$cwd_now/$file"
+            path=$(realpath "$path")
+            if [[ $? -ne 0 ]]; then
+                echo "ERROR - failed to resolve path: $path ($file)" >&2
+                return 2
+            fi
             echo "$path ..."
             # Metadata
             local size mtime hash
@@ -626,7 +637,9 @@ function cwd_at_item {
     local cwd=$2
     local cwd_now
     [ -z "$cwd" ] && cwd=$PWD
-    cwd_now=$cwd
+    cwd_now=
+    # Not prepending cwd unless explicit path prefix specified
+    # Otherwise, we might prepend cwd to an absolute path.
 
     # Check for user-defined parent directory (starting at index i)
     for j in ${!REL_DIRS[@]}; do
@@ -634,6 +647,7 @@ function cwd_at_item {
         cur_from_i=${cur_par%%;*}
         cur_parent=${cur_par#*;}
         # Apply if we're at that position only
+        # "only"/eq: a base path is applied to the following arg only
         if [[ $cur_from_i -eq $pos ]]; then
             cwd_now=$cur_parent
         fi
@@ -861,8 +875,10 @@ if [[ $cmd == "create" || $cmd == "append" ]]; then
 
     # Check for existing archive that would be overwritten
     if (( $CHECK_EXISTING )); then
+        # Run extract call in subshell because an error shouldn't be fatal
         tmp_toc_file=$(tmp_file)
-        if extract_toc_file "$tmp_toc_file" 2>/dev/null 1>&2; then
+        out=$(extract_toc_file "$tmp_toc_file" 2>/dev/null 1>&2)
+        if [[ $? -eq 0 ]]; then
             echo "# TAR ARCHIVE HEADER DETECTED IN CURRENT TAPE FILE..." >&2
             ask "Really continue, overwriting previous contents?" || exit 2
 
@@ -938,7 +954,11 @@ if [[ $cmd == "create" || $cmd == "append" ]]; then
         item="${ITEMS[i]}"
         cwd_now=$(cwd_at_item "$i" $cwd)
         # Add item (may be relative to a previously defined parent dir)
-        args+=("-C" "$cwd_now" "$item")
+        if [[ -z "$cwd_now" ]]; then
+            args+=("$item")
+        else
+            args+=("-C" "$cwd_now" "$item")
+        fi
     done
 
     # Run tar to start the process
