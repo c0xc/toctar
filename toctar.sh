@@ -94,6 +94,7 @@ shift
 IS_TAPE=0
 KEEP_TEMP_DIR=0
 TAR_FILE=
+IS_AUTO_APPEND=0
 IS_MULTI=0 # TODO
 ITEMS=()
 REL_DIRS=()
@@ -118,6 +119,18 @@ while [[ $# -gt 0 ]]; do
                 exit 1
             fi
             shift
+            ;;
+        -i|--index|--tape-file)
+            # Disable auto-append if tape file specified
+            TAPE_FILE_INDEX=$2
+            IS_AUTO_APPEND=0
+            shift
+            ;;
+        --auto-append)
+            IS_AUTO_APPEND=1
+            ;;
+        --no-auto-append)
+            IS_AUTO_APPEND=0
             ;;
         --multi-volume)
             IS_MULTI=1
@@ -209,27 +222,36 @@ function set_device {
 }
 set_device
 
+# Rewinds the tape to the beginning [of the specified tape file]
 function rewind {
-    local index={1:-0}
+    local index=${1:-$TAPE_FILE_INDEX}
 
     if [[ $IS_TAPE -eq 0 ]]; then
         return 0
     fi
 
-    $MT -f "$TAR_FILE" asf "$index" || return $?
+    # TODO export $TAPE
+    if [[ -n "$index" ]]; then
+        $MT -f "$TAR_FILE" asf "$index" || return $?
+    else
+        $MT -f "$TAR_FILE" rewind || return $?
+    fi
 }
 
+# Returns the status number output
 function tape_status_number {
     if [[ $IS_TAPE -ne 0 ]]; then
         $MT -f "$TAR_FILE" status | grep number
     fi
 }
 
+# Creates a temp file which will be deleted on exit
 function tmp_file {
     # Create and return temp file (in temp dir)
     mktemp --tmpdir="$TMP_DIR" ".TARTOC.XXXXXXXXXX" || return $?
 }
 
+# Detects the block size or returns that value if already detected
 function detect_bs_once {
     # Return already detected bs
     # : ${DETECTED_BS:=0}
@@ -243,14 +265,59 @@ function detect_bs_once {
         echo 0
         return 1
     fi
-    rewind $TAPE_FILE_INDEX || return $?
+    rewind || return $?
 
     # Detect block size once
     DETECTED_BS=$(detect_block_size)
     echo -n "$DETECTED_BS"
 
     # Rewind tape
-    rewind $TAPE_FILE_INDEX || return $?
+    rewind || return $?
+}
+
+# Counts the number of tape files containing TOCTAR archives
+# NOTE THIS WILL NOT DETECT/COUNT THE LAST VOLUME OF A MULTI-VOLUME ARCHIVE!
+# The TOCTAR header is counted, which is at the beginning.
+# The last volume/tape of a multi-volume archive would have a tar header
+# in its [first/only] tape file but not a TOCTAR header.
+# TODO count tar headers as well to prevent admins from destroying mv archives
+function count_toctar_archives {
+    # Goes through all tape files on the tape which contain an archive
+    # This may be used to find the end of the last tape file / archive,
+    # to safely create another archive in a new tape file after that.
+    # IS_AUTO_APPEND
+
+    # Rewind tape
+    rewind || return $?
+
+    # Temp file
+    local tmp_toc_file=$(tmp_file)
+
+    # Count and detect archives until the (logical) end (like 2 filemarks)
+    local count=0
+    while :; do
+        # Rewind tape / go to beginning of tape file
+        # First iteration: count = 0, index 0, count++ if found
+        rewind "$count" 2>/dev/null 1>&2 || break
+
+        # Try to read TOC
+        # If it fails (TOC area does not contain TOC), it's not a TOCTAR archive
+        # Note that only the first tape contains the TOC
+        if extract_toc_file "$tmp_toc_file"; then
+            # Found archive in tape file at current position!
+            ((count++))
+            echo "# Found TOCTAR archive in tape file $((count-1))" >&2
+        else
+            # No archive detected, done
+            # If this tape file does not contain an archive
+            # but just "bad" data or something, it is considered safe
+            # to be overwritten with a new archive.
+            # Either way, it's not an archive, which is what we're counting.
+            break
+        fi
+    done
+
+    echo "$count"
 }
 
 ################################################################################
@@ -381,7 +448,7 @@ function detect_block_size {
         echo 0
         return 1
     fi
-    rewind $TAPE_FILE_INDEX || return $?
+    rewind || return $?
 
     # Temp file
     local ts=$(date +%s)
@@ -439,7 +506,7 @@ function detect_block_size {
     done
 
     # Rewind tape
-    rewind $TAPE_FILE_INDEX || return $?
+    rewind || return $?
 }
 
 # TOC file extractor
@@ -481,7 +548,7 @@ function extract_toc_file {
         if [ $IS_AUTO_DETECT_BS -ne 0 ]; then
             bs=$(detect_bs_once) || return $?
         fi
-        rewind $TAPE_FILE_INDEX || return $?
+        rewind || return $?
     fi
 
     # Extract TOC to file (or stdout)
@@ -594,7 +661,7 @@ function replace_toc {
         if [ $IS_AUTO_DETECT_BS -ne 0 ]; then
             bs=$(detect_bs_once) || return $?
         fi
-        rewind $TAPE_FILE_INDEX || return $?
+        rewind || return $?
     fi
 
     # Extract TOC section (from the beginning)
@@ -604,7 +671,7 @@ function replace_toc {
     local size=$(stat --printf "%s" "$tmp_section_file")
     local out_count=$((size/bs))
     # Rewind again
-    rewind $TAPE_FILE_INDEX || return $?
+    rewind || return $?
 
     # Now copy TOC from source file into temporary file (after header)
     local dd_out
@@ -873,6 +940,19 @@ if [[ $cmd == "create" || $cmd == "append" ]]; then
         ask "Please insert the [first] drive and confirm (hit Ctrl+C or type N to abort)" || exit 2
     fi
 
+    # Move tape forward if auto-append is enabled
+    # This is an automatism to prevent an existing archive
+    # from being overwritten.
+    # Appending does not refer to the append feature of tar,
+    # it will append a new tape file after the last tape file.
+    if (( $IS_TAPE && $IS_AUTO_APPEND )); then
+        echo "### AUTO APPEND SCANNING..." >&2
+        TAPE_FILE_INDEX=$(count_toctar_archives) || return $?
+        if [[ "$TAPE_FILE_INDEX" -gt 0 ]]; then
+            echo "### FOUND $TAPE_FILE_INDEX ARCHIVES, APPENDING" >&2
+        fi
+    fi
+
     # Check for existing archive that would be overwritten
     if (( $CHECK_EXISTING )); then
         # Run extract call in subshell because an error shouldn't be fatal
@@ -880,8 +960,8 @@ if [[ $cmd == "create" || $cmd == "append" ]]; then
         out=$(extract_toc_file "$tmp_toc_file" 2>/dev/null 1>&2)
         if [[ $? -eq 0 ]]; then
             echo "# TAR ARCHIVE HEADER DETECTED IN CURRENT TAPE FILE..." >&2
+            echo "# (HAVE YOU TRIED OUR NEW --auto-append FEATURE?)" >&2
             ask "Really continue, overwriting previous contents?" || exit 2
-
         fi
     fi
 
@@ -919,7 +999,7 @@ if [[ $cmd == "create" || $cmd == "append" ]]; then
         # Specify TOC as first file in the new archive
         args+=("-c" "-C" "$TMP_DIR" "${toc_file##*/}")
         # Rewind to beginning of [first] tape file
-        rewind $TAPE_FILE_INDEX || exit $?
+        rewind || exit $?
     elif [[ $cmd == "append" ]]; then
         # Replace old TOC on tape with new TOC
         # This is the crucial part. We are overwriting the first section
@@ -944,7 +1024,7 @@ if [[ $cmd == "create" || $cmd == "append" ]]; then
         # $MT -f "$TAR_FILE" fsfm 0
         # /dev/nst0: Input/output error
         if [[ $IS_TAPE -eq 1 ]]; then
-            rewind $TAPE_FILE_INDEX || exit $?
+            rewind || exit $?
         fi
     fi
 
@@ -1062,7 +1142,7 @@ elif [[ $cmd == "verify" ]]; then
     fi
 
     # Rewind tape (again)
-    rewind $TAPE_FILE_INDEX || exit $?
+    rewind || exit $?
 
     # Tar arguments
     args=()

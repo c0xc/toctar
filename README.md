@@ -42,20 +42,36 @@ As TOCTAR was designed with LTO tapes in mind, it defaults to using
 a (the first) tape device found in the system.
 To work with an archive file somewhere on your filesystem,
 use the `-f file.tar` option.
+On tapes, TOCTAR works with the first tape file by default.
+To work with more than one archive per tape, please refer to the index option
+or check out the --auto-append feature.
 
 To create a new archive (overwriting an existing file):
 
     toctar create [-C parent_dir1] dir1 [-C parent_dir2] dir2
 
-To append files to an existing archive:
-
-    toctar append dir...
-
-To create another archive, in the second tape file:
+To create an archive in the second tape file:
 
     toctar create -i 1 dir...
 
-To verify an archiv:
+To create a new archive at the end, leaving existing archives:
+
+    toctar create --auto-append dir...
+
+This may fail if you have a corrupt/incomplete archive in a tape file.
+For example, if you've created two archives and damaged the second one
+but you haven't wiped the tape because you don't want to lose the first
+archive on there, then use the index option (-i 1) to overwrite the second one.
+
+To list the contents of an archive:
+
+    toctar verify
+
+To list the contents of the second archive:
+
+    toctar verify -i 1
+
+To verify an archive:
 
     toctar verify
 
@@ -63,6 +79,9 @@ To extract an archive:
 
     toctar extract
 
+During a "create" process, you'll notice that most status messages
+are prefixed with a hash sign (#) and sent to stderr.
+That's done to make it easier to filter those away.
 
 
 
