@@ -136,5 +136,12 @@ Philip Seeger (philip@c0xc.net)
 License
 -------
 
-Please see the file called LICENSE.
+This program may be used, modified and redistributed free of charge.
+I'd like to add one condition: Elements of the military-industrial complex
+and organizations working on a 1984-like total surveillance state
+are prohibited from using this program (modified or not).
+
+Please see the file called LICENSE if you enjoy complicated legal jargon.
+
+
 
