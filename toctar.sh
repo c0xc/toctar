@@ -341,8 +341,8 @@ function create_toc_file {
     local item path item_items file
     for i in ${!ITEMS[@]}; do
         item="${ITEMS[i]}"
-        cwd_now=$(cwd_at_item "$i" $cwd)
-        path="$cwd_now/$item"
+        cwd_now=$(cwd_for_item "$i")
+        path=$(path_for_item "$i")
         # path - real path to item (file)
         # item - filename or path relative to current parent dir (-C)
         # item is what we're putting in the tarball and in the TOC
@@ -359,16 +359,22 @@ function create_toc_file {
         fi
 
         # Item list - current file or directory contents
+        # A file is just added to the list; a directory is listed
         item_items=
         if [[ -f "$path" ]]; then
             item_items=$item
         elif [[ -d "$path" ]]; then
             # Scan dir recursively to add all files to TOC
             # Results in relative path arguments are prefixed accordingly
-            if [[ -z "$cwd_now" ]]; then
-                item_items=$(find "$path" -mindepth 1 -type f)
+            # A relative dir arg "mydir" with a base arg "mybase"
+            # will be scanned and the files will be listed
+            # as "mydir/myfile1" (without the "mybase/" path prefix).
+            # find -exec realpath --relative-to "$cwd_now"
+            if [[ -n "$cwd_now" && "$item" =~ ^[^/] ]]; then
+                # Relative path, cd to list contents within base
+                item_items=$(cd "$cwd_now" && find "$item" -mindepth 1 -type f)
             else
-                item_items=$(find "$path" -mindepth 1 -type f -exec realpath --relative-to "$cwd_now" {} \;)
+                item_items=$(find "$path" -mindepth 1 -type f)
             fi
             if (( $? || ${PIPESTATUS[0]} )); then
                 echo "ERROR - failed to scan directory: $path" >&2
@@ -381,7 +387,11 @@ function create_toc_file {
         while IFS= read -r file; do
             # again, path is the full path, file is relative to tar
             # Prepend base path (if specified)
-            path="$cwd_now/$file"
+            if [[ -n "$cwd_now" && "$item" =~ ^[^/] ]]; then
+                path="$cwd_now/$file"
+            else
+                path="$file"
+            fi
             path=$(realpath "$path")
             if [[ $? -ne 0 ]]; then
                 echo "ERROR - failed to resolve path: $path ($file)" >&2
@@ -698,29 +708,62 @@ echo "tmp_section_file=$tmp_section_file ($dd_out) " >&2
 
 }
 
-# Get parent dir of item at specified position
-function cwd_at_item {
+# Get previous base/parent dir argument, if specified
+function cwd_for_item {
     local pos=$1
-    local cwd=$2
-    local cwd_now
-    [ -z "$cwd" ] && cwd=$PWD
-    cwd_now=
+    local cmp_eq=$2
+
     # Not prepending cwd unless explicit path prefix specified
     # Otherwise, we might prepend cwd to an absolute path.
+    local cwd_now=
 
     # Check for user-defined parent directory (starting at index i)
     for j in ${!REL_DIRS[@]}; do
         cur_par="${REL_DIRS[j]}"
         cur_from_i=${cur_par%%;*}
         cur_parent=${cur_par#*;}
-        # Apply if we're at that position only
+        # Apply previous base arg
         # "only"/eq: a base path is applied to the following arg only
-        if [[ $cur_from_i -eq $pos ]]; then
-            cwd_now=$cur_parent
+        # "previous"/le: a base path is applied to all following item args
+        if [[ -n "$cmp_eq" ]]; then
+            # Get base argument for this index only
+            if [[ $cur_from_i -eq $pos ]]; then
+                cwd_now=$cur_parent
+            fi
+        else
+            # Get last base argument
+            if [[ $cur_from_i -le $pos ]]; then
+                cwd_now=$cur_parent
+            fi
         fi
     done
 
     echo "$cwd_now"
+}
+
+# Get parent dir argument at / directly in front of item at specified position
+function cwd_eq_item {
+    local pos=$1
+    cwd_for_item "$pos" eq
+}
+
+# Get path of item at specified position (for create operation)
+function path_for_item {
+    local pos=$1
+
+    local item="${ITEMS[pos]}"
+    [[ -z "$item" ]] && return 1
+    local path
+    path="$item"
+    if [[ "$item" =~ ^[^/] ]]; then
+        # Relative path
+        local base=$(cwd_for_item "$pos")
+        if [[ -n "$base" ]]; then
+            path="$base/$path"
+        fi
+    fi
+
+    echo "$path"
 }
 
 # Ask user to something (INTERACTIVE)
@@ -769,13 +812,16 @@ function gen_script {
         exit;
     }
 
+    # Env settings
+    my $print_hash = $ENV{PRINT_HASH};
+
     # Read TOC file (map)
     # If a later/newer TOC section contains an old file again,
     # it's just updated in the map.
     my $map = {};
     my $toc_file = "%TOC_FILE%";
     my $in_toc_section;
-    if (open(my $fh, '<:encoding(UTF-8)', $toc_file)) {
+    if (open(my $fh, '<', $toc_file)) {
         while (my $row = <$fh>) {
             chomp $row;
             if (index($row, "\0") > -1) {
@@ -812,11 +858,24 @@ function gen_script {
 
     }
     else {
-        die "### FAILED TO OPEN TOC: $toc_file";
+        die "### FAILED TO OPEN TOC: $toc_file\n";
     }
-    my $toc = $map->{$tar_realname};
+    my $toc;
+    if (exists($map->{$tar_realname})) {
+        # Exact match, file found in TOC
+        $toc = $map->{$tar_realname};
+    }
+    else {
+        # File not found in TOC, probably because of leading slash
+        # Go through TOC and find matching key
+        my $kk = [grep({ s:^[/]*::r eq $tar_realname } keys %$map)];
+        my $k = [grep({ s:^[/]*::r eq $tar_realname } keys %$map)]->[0];
+        if (defined($k)) {
+            $toc = $map->{$k};
+        }
+    }
     if (!$toc) {
-        die "### FAILED TO FIND CONTENT FILE IN TOC: $tar_realname";
+        die "### FAILED TO FIND CONTENT FILE IN TOC: $tar_realname\n";
     }
 
     # Prepare output stream
@@ -840,7 +899,10 @@ function gen_script {
     }
     my $hash;
     $hash = $sha256->hexdigest;
-    print STDERR "$hash => ";
+    if ($print_hash) {
+        print STDERR "$hash ";
+    }
+    print STDERR "=> ";
 
     # TODO get TOC (tmp file) and compare hash sum
     # Check if calculated hash matches hash in TOC
@@ -913,6 +975,16 @@ function toc_file_list {
     done <<<"$toc_lines"
 }
 
+function first_tape {
+    if [[ $IS_TAPE -eq 0 ]]; then
+        return
+    fi
+
+    if [[ $IS_MULTI -eq 1 ]]; then
+        ask "Please insert the [first] tape" || exit 2
+    fi
+}
+
 ################################################################################
 
 # Most info, warn and debug messages are sent to stderr by default.
@@ -932,13 +1004,15 @@ if [[ $cmd == "create" || $cmd == "append" ]]; then
 
     # TODO append to same archive... ask for last tape, then append ...
     # fsfm or similar to not create another tape file
+    if [[ $cmd == "append" && $IS_TAPE -eq 1 ]]; then
+        echo "Appending to tape archives not support" >&2
+        exit 2
+    fi
 
     # Say something and confirm
     echo "### CREATING TARBALL BACKUP => ${TAR_NAME}..." >&2
     echo "### THIS WILL OVERWRITE THE TAPE ARCHIVE AT ${TAR_FILE} [#$TAPE_FILE_INDEX] ..." >&2
-    if [[ $IS_MULTI -eq 1 ]]; then
-        ask "Please insert the [first] drive and confirm (hit Ctrl+C or type N to abort)" || exit 2
-    fi
+    first_tape
 
     # Move tape forward if auto-append is enabled
     # This is an automatism to prevent an existing archive
@@ -1030,9 +1104,10 @@ if [[ $cmd == "create" || $cmd == "append" ]]; then
 
     # Add directory items (free arguments)
     cwd_now=$cwd
+    args+=("-C" "$cwd_now")
     for i in ${!ITEMS[@]}; do
         item="${ITEMS[i]}"
-        cwd_now=$(cwd_at_item "$i" $cwd)
+        cwd_now=$(cwd_eq_item "$i")
         # Add item (may be relative to a previously defined parent dir)
         if [[ -z "$cwd_now" ]]; then
             args+=("$item")
@@ -1128,7 +1203,9 @@ elif [[ $cmd == "compare" ]]; then
 
 elif [[ $cmd == "verify" ]]; then
     # Verify files on tape by re-calculating their checksums
-    ask "Please insert the [first] drive" || exit $?
+
+    # Ask for first tape (multi-volume archive)
+    first_tape
 
     # Read TOC
     tmp_toc_file=$(tmp_file)
@@ -1144,6 +1221,9 @@ elif [[ $cmd == "verify" ]]; then
     # Rewind tape (again)
     rewind || exit $?
 
+    # Prepare verification script
+    script=$(gen_script "$tmp_toc_file") || exit $?
+
     # Tar arguments
     args=()
     args+=("-b" "$TAR_FACTOR")
@@ -1152,9 +1232,8 @@ elif [[ $cmd == "verify" ]]; then
     args+=("-x")
     args+=("--to-command=$script")
 
-    # Run tar with custom verification script
-    script=$(gen_script "$tmp_toc_file") || exit $?
-    tar "${args[@]}"
+    # Run tar with verification script
+    tar "${args[@]}" "${ITEMS[@]}"
 
 elif [[ $cmd == "extract" ]]; then
     # Extract tape archive verifying each file in the process
