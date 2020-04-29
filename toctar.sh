@@ -98,7 +98,7 @@ IS_AUTO_APPEND=0
 IS_MULTI=0 # TODO
 ITEMS=()
 REL_DIRS=()
-IS_AUTO_DETECT_BS=1
+IS_AUTO_DETECT_BS=0
 CHECK_EXISTING=1
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -251,7 +251,20 @@ function tmp_file {
     mktemp --tmpdir="$TMP_DIR" ".TARTOC.XXXXXXXXXX" || return $?
 }
 
+# File size helper
+function file_size {
+    local file=$1
+    stat --printf '%s' "$file"
+}
+
+# File mtime helper
+function file_mtime {
+    local file=$1
+    stat --printf '%Y' "$file"
+}
+
 # Detects the block size or returns that value if already detected
+# Note that this will rewind the tape
 function detect_bs_once {
     # Return already detected bs
     # : ${DETECTED_BS:=0}
@@ -269,6 +282,13 @@ function detect_bs_once {
 
     # Detect block size once
     DETECTED_BS=$(detect_block_size)
+    if [[ $? -ne 0 ]]; then
+        # Failed to detect block size, print/return pre-defined block size
+        echo -n "$DETECTED_BS"
+        return 2
+    fi
+
+    # Print detected block size
     echo -n "$DETECTED_BS"
 
     # Rewind tape
@@ -276,37 +296,71 @@ function detect_bs_once {
 }
 
 # Counts the number of tape files containing TOCTAR archives
-# NOTE THIS WILL NOT DETECT/COUNT THE LAST VOLUME OF A MULTI-VOLUME ARCHIVE!
+# Returns the count on stdout (info, warnings on stderr)
 # The TOCTAR header is counted, which is at the beginning.
 # The last volume/tape of a multi-volume archive would have a tar header
 # in its [first/only] tape file but not a TOCTAR header.
-# TODO count tar headers as well to prevent admins from destroying mv archives
 function count_toctar_archives {
     # Goes through all tape files on the tape which contain an archive
     # This may be used to find the end of the last tape file / archive,
     # to safely create another archive in a new tape file after that.
     # IS_AUTO_APPEND
 
+    # Get block size
+    local bs=$TAPE_BS_B
+
     # Rewind tape
     rewind || return $?
 
     # Temp file
-    local tmp_toc_file=$(tmp_file)
+    local tmp_file=$(tmp_file)
 
     # Count and detect archives until the (logical) end (like 2 filemarks)
+    local err_out; local rc
     local count=0
     while :; do
         # Rewind tape / go to beginning of tape file
         # First iteration: count = 0, index 0, count++ if found
         rewind "$count" 2>/dev/null 1>&2 || break
 
-        # Try to read TOC
-        # If it fails (TOC area does not contain TOC), it's not a TOCTAR archive
-        # Note that only the first tape contains the TOC
-        if extract_toc_file "$tmp_toc_file"; then
-            # Found archive in tape file at current position!
+        # Try to read next block (beginning)
+        echo -n >"$tmp_file"
+        dd_out=$(dd bs=$bs count=1 if="$TAR_FILE" of="$tmp_file" 2>&1)
+        if [[ $? -ne 0 ]]; then
+            # Failed to read tape file, done
+            echo "READ ERROR" >&2
+            echo "$dd_out" >&2
+            return 1
+        fi
+
+        # Stop if no data read
+        if [[ $(file_size "$tmp_file") -eq 0 ]]; then
+            # DEBUG "EOF / NO DATA READ"
+            break
+        fi
+
+        # Try to detect TOCTAR archive
+        # Only the beginning of the archive can be detected (first tape)
+        err_out=$(is_toctar_block "$tmp_file" 2>&1); rc=$?
+        if [[ $rc -eq 0 ]]; then
+            # DEBUG "TOCTAR ARCHIVE DETECTED!"
             ((count++))
             echo "# Found TOCTAR archive in tape file $((count-1))" >&2
+            continue
+        fi
+
+        # # Try to detect "anything else" as well
+        # if [[ $(file_size "$tmp_file") -gt 0 ]]; then
+        #     # DEBUG "SKIPPING OVER UNRECOGNIZED TAPE FILE!"
+        #     continue
+        # fi
+
+        # Detect TAR archive
+        err_out=$(is_tar_block "$tmp_file" 2>&1); rc=$?
+        if [[ $rc -eq 0 ]]; then
+            # Found archive in tape file at current position!
+            ((count++))
+            echo "# Found tar archive in tape file $((count-1))" >&2
         else
             # No archive detected, done
             # If this tape file does not contain an archive
@@ -400,8 +454,8 @@ function create_toc_file {
             echo "$path ..."
             # Metadata
             local size mtime hash
-            size=$(stat --printf '%s' "$path")
-            mtime=$(stat --printf '%Y' "$path")
+            size=$(file_size "$path")
+            mtime=$(file_mtime "$path")
             if [[ -z "$size" || -z "$mtime" ]]; then
                 echo "ERROR - failed to stat file: $path" >&2
                 return 2
@@ -436,7 +490,7 @@ function create_toc_file {
 
     # Expand TOC file to fixed TOC size (128 MB) by zero-padding
     # That way, it can be extended later
-    toc_size=$(stat --printf "%s" "$toc_file")
+    toc_size=$(file_size "$toc_file")
     if [[ $toc_size -gt $TOC_FIX_SIZE ]]; then
         echo "ERROR - TOC too big ($toc_size B)" >&2
         return 2
@@ -484,7 +538,7 @@ function detect_block_size {
     local read_b_dd read_b_file real_bs
     dd_line=$(echo "$dd_out" | grep -E '^[0-9]+ bytes.*copied') || return $?
     read_b_dd=$(echo "$dd_line" | grep -Eo '^[0-9]+') || return $?
-    read_b_file=$(stat --printf "%s" "$tmp_file") || return $?
+    read_b_file=$(file_size "$tmp_file") || return $?
     if [[ "$read_b_dd" != "$read_b_file" ]]; then
         echo "ERROR - block size mismatch ($read_b_dd != $read_b_file)" >&2
         return 1
@@ -517,6 +571,127 @@ function detect_block_size {
 
     # Rewind tape
     rewind || return $?
+}
+
+# Archive detection helper
+# Reads the next block and checks if it gets a tar header.
+# If yes, the tape file that we've read contains a tar archive.
+function is_tar_block {
+    local input_file=$1
+    local tmp_file=$2
+
+    # Temp file
+    if [ -z "$tmp_file" ]; then
+        tmp_file=$(tmp_file) || return 1
+    else
+        if ! [[ $(readlink -f "$tmp_file") =~ ^/tmp ]]; then
+            # Temp file not in temp dir # TODO global safeguard function
+            return 1
+        fi
+    fi
+
+    # Get block size (not a good time to run block size detection now)
+    local bs=$TAPE_BS_B
+
+    # Read (unless input data provided)
+    local dd_out
+    if [[ -z "$input_file" ]]; then
+        # Read one block
+        dd_out=$(dd bs=$bs count=1 if="$TAR_FILE" of="$tmp_file" 2>&1)
+        if [[ $? -ne 0 ]]; then
+            echo "$dd_out" >&2
+            return 1
+        fi
+    else
+        # Just copy input to temp file
+        dd_out=$(dd bs=$bs if="$input_file" of="$tmp_file" 2>&1)
+        if [[ $? -ne 0 ]]; then
+            echo "$dd_out" >&2
+            return 1
+        fi
+    fi
+    if [[ $(file_size "$tmp_file") == 0 ]]; then
+        echo "ERROR - NO INPUT DATA OR BLOCK TOO SMALL" >&2
+        return 1
+    fi
+
+    # Extract "ustar" magic header
+    local extracted
+    extracted=$(dd if="$tmp_file" skip=257 bs=1 count=7)
+    if [[ $? -ne 0 ]]; then
+        echo "ERROR - NO INPUT DATA OR BLOCK TOO SMALL" >&2
+        return 1
+    fi
+
+    # Check what we've got
+    if [[ "$(echo "$extracted")" == "ustar  " ]]; then
+        # Found tar header
+        return 0
+    else
+        echo "NO TAR HEADER FOUND" >&2
+        return 2
+    fi
+}
+
+# Archive detection helper
+# Reads the next block and checks if it gets a TOCTAR header.
+# If yes, the tape file that we've read contains a TOCTAR archive.
+# TODO clean up code duplication ...
+function is_toctar_block {
+    local input_file=$1
+    local tmp_file=$2
+
+    # Temp file
+    if [ -z "$tmp_file" ]; then
+        tmp_file=$(tmp_file) || return 1
+    else
+        if ! [[ $(readlink -f "$tmp_file") =~ ^/tmp ]]; then
+            # Temp file not in temp dir # TODO global safeguard function
+            return 1
+        fi
+    fi
+
+    # Get block size (not a good time to run block size detection now)
+    local bs=$TAPE_BS_B
+
+    # Read (unless input data provided)
+    local dd_out
+    if [[ -z "$input_file" ]]; then
+        # Read one block
+        dd_out=$(dd bs=$bs count=1 if="$TAR_FILE" of="$tmp_file" 2>&1)
+        if [[ $? -ne 0 ]]; then
+            echo "$dd_out" >&2
+            return 1
+        fi
+    else
+        # Just copy input to temp file
+        dd_out=$(dd bs=$bs if="$input_file" of="$tmp_file" 2>&1)
+        if [[ $? -ne 0 ]]; then
+            echo "$dd_out" >&2
+            return 1
+        fi
+    fi
+    if [[ $(file_size "$tmp_file") == 0 ]]; then
+        echo "ERROR - NO INPUT DATA OR BLOCK TOO SMALL" >&2
+        return 1
+    fi
+
+    # Extract TOCTAR header (TOC at beginning)
+    local extracted
+    extracted=$(dd if="$tmp_file" skip=512 bs=1 count=100)
+    if [[ $? -ne 0 ]]; then
+        echo "ERROR - NO INPUT DATA OR BLOCK TOO SMALL" >&2
+        return 1
+    fi
+
+    # Check what we've got
+    if [[ "$(echo "$extracted" | head -c 5)" == "# TOC" ]]; then
+        # Found TOCTAR header
+        return 0
+    else
+        echo "NO TOCTAR HEADER FOUND" >&2
+        return 2
+    fi
 }
 
 # TOC file extractor
@@ -603,7 +778,7 @@ function extract_toc_file {
         fi
 
         # Double-check size (if < count*bs)
-        local read_bytes=$(stat --printf "%s" "$toc_file")
+        local read_bytes=$(file_size "$toc_file")
         if [[ $read_bytes -ne $TOC_FIX_SIZE ]]; then
             # TODO print tape status for debugging
             tape_status_number
@@ -659,7 +834,7 @@ function replace_toc {
     # To read a short story about block sizes, see extract_toc_file...
 
     # Double-check input size
-    toc_size=$(stat --printf "%s" "$toc_file")
+    toc_size=$(file_size "$toc_file")
     if [[ $toc_size -ne $TOC_FIX_SIZE ]]; then
         echo "ERROR - new TOC is ${toc_size}B, must be ${TOC_FIX_SIZE}B" >&2
         return 2
@@ -678,7 +853,7 @@ function replace_toc {
     tmp_toc_file=$(tmp_file) || return 1
     tmp_section_file=$(tmp_file) || return 1
     extract_toc_file "$tmp_toc_file" "$tmp_section_file" || return 1
-    local size=$(stat --printf "%s" "$tmp_section_file")
+    local size=$(file_size "$tmp_section_file")
     local out_count=$((size/bs))
     # Rewind again
     rewind || return $?
@@ -987,6 +1162,67 @@ function first_tape {
 
 ################################################################################
 
+function detect_tape_files {
+    # This is essentially a copy of the count_toctar_archives() function.
+    # If this wasn't a cheap bash script, I wouldn't do this.
+    # But it is. So here's some code duplication.
+
+    # Get block size
+    local bs=$TAPE_BS_B
+    # TODO detect_bs_once yadda
+
+    # Temp file
+    local tmp_file=$(tmp_file)
+
+    # Count and detect archives until the (logical) end (like 2 filemarks)
+    local dd_out
+    local err_out rc
+    local count=0
+    while :; do
+        # Rewind tape / go to beginning of tape file
+        rewind "$count" 2>/dev/null 1>&2 || break
+
+        # Read (beginning)
+        echo -n "[$count] ... "
+        echo -n >"$tmp_file"
+        dd_out=$(dd bs=$bs count=1 if="$TAR_FILE" of="$tmp_file" 2>&1)
+        if [[ $? -ne 0 ]]; then
+            # Failed to read tape file, done
+            echo "READ ERROR" >&2
+            echo "$dd_out" >&2
+            return 1
+        fi
+
+        # Stop if no data read
+        if [[ $(file_size "$tmp_file") -eq 0 ]]; then
+            echo "EOF / NO DATA READ"
+            break
+        fi
+
+        # Check for TOCTAR archive (beginning / first tape only)
+        err_out=$(is_toctar_block "$tmp_file" 2>&1); rc=$?
+        if [[ $rc -eq 0 ]]; then
+            echo "TOCTAR ARCHIVE DETECTED!"
+            ((count++))
+            continue
+        fi
+
+        # Check for TAR archive
+        err_out=$(is_tar_block "$tmp_file" 2>&1); rc=$?
+        if [[ $rc -eq 0 ]]; then
+            echo "NO TOCTAR HEADER, BUT TAR ARCHIVE DETECTED!"
+            ((count++))
+            continue
+        else
+            echo "FILE CONTENT NOT RECOGNIZED!"
+            echo "$err_out" >&2
+            break
+        fi
+    done
+    echo "TAPE FILES FOUND: $count"
+
+}
+
 # Most info, warn and debug messages are sent to stderr by default.
 # That way, this extra output can be turned off
 # and it won't be mixed with content/data, which is written to stdout.
@@ -1021,7 +1257,7 @@ if [[ $cmd == "create" || $cmd == "append" ]]; then
     # it will append a new tape file after the last tape file.
     if (( $IS_TAPE && $IS_AUTO_APPEND )); then
         echo "### AUTO APPEND SCANNING..." >&2
-        TAPE_FILE_INDEX=$(count_toctar_archives) || return $?
+        TAPE_FILE_INDEX=$(count_toctar_archives) || exit $? # TODO function, return, cleanup
         if [[ "$TAPE_FILE_INDEX" -gt 0 ]]; then
             echo "### FOUND $TAPE_FILE_INDEX ARCHIVES, APPENDING" >&2
         fi
@@ -1162,6 +1398,12 @@ elif [[ $cmd == "detect" ]]; then
         echo "### NO TOC DETECTED! This does not look like a TOCTAR archive." >&2
         exit 1
     fi
+
+elif [[ $cmd == "detect-tape-files" ]]; then
+    # Go through each tape file to detect TOCTAR or regular archives
+    # This will use the same search function as auto-append
+    echo "### DETECTING TOCTAR ARCHIVES <= ${TAR_NAME}..." >&2
+    detect_tape_files "$@"
 
 elif [[ $cmd == "bs" ]]; then
     # Detect block size
