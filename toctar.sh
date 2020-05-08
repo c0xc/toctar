@@ -91,18 +91,20 @@ esac
 shift
 
 # Options and arguments
+IS_DEBUG=0
 IS_TAPE=0
 KEEP_TEMP_DIR=0
 TAR_FILE=
 IS_AUTO_APPEND=0
 IS_MULTI=0 # TODO
 ITEMS=()
+EXCLUDE=()
 REL_DIRS=()
 IS_AUTO_DETECT_BS=0
 CHECK_EXISTING=1
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --debug)
+        -v|--debug)
             IS_DEBUG=1
             ;;
         -f|--archive)
@@ -144,6 +146,10 @@ while [[ $# -gt 0 ]]; do
             REL_DIRS+=("$parent_dir_entry")
             shift
             ;;
+        --exclude)
+            EXCLUDE+=("$2")
+            shift
+            ;;
         --auto-detect-bs)
             IS_AUTO_DETECT_BS=1
             ;;
@@ -179,6 +185,16 @@ if [[ $# -gt 0 ]]; then
     ITEMS+=("$@")
     shift $#
 fi
+
+################################################################################
+
+function DEBUG {
+    local msg="$*"
+
+    if (( IS_DEBUG )); then
+        echo "$msg" >&2
+    fi
+}
 
 ################################################################################
 
@@ -381,7 +397,7 @@ function count_toctar_archives {
 # Writes TOC to file (by appending if old TOC provided)
 # Final TOC file is zero-padded to use up fixed TOC size
 function create_toc_file {
-    local toc_file=$1 # TODO no need for local, toc_file is a global const
+    local toc_file=$1
 
     # Add TOC header entry
     local ts ts2 entry
@@ -451,6 +467,22 @@ function create_toc_file {
                 echo "ERROR - failed to resolve path: $path ($file)" >&2
                 return 2
             fi
+
+            # Skip (inc)luded file if (exc)luded
+            local exc inc is_excluded
+            inc="$file"
+            is_excluded=0
+            for i in ${!EXCLUDE[@]}; do
+                exc="${EXCLUDE[i]}"
+                if [[ "$inc" =~ ^"$exc"(/|$) ]]; then
+                    DEBUG "SKIP: $path"
+                    is_excluded=1
+                fi
+            done
+            if (( $is_excluded )); then
+                continue
+            fi
+
             echo "$path ..."
             # Metadata
             local size mtime hash
@@ -1338,6 +1370,12 @@ if [[ $cmd == "create" || $cmd == "append" ]]; then
         fi
     fi
 
+    # Add excluded items
+    for i in ${!EXCLUDE[@]}; do
+        item="${EXCLUDE[i]}"
+        args+=("--exclude" "$item")
+    done
+
     # Add directory items (free arguments)
     cwd_now=$cwd
     args+=("-C" "$cwd_now")
@@ -1355,6 +1393,7 @@ if [[ $cmd == "create" || $cmd == "append" ]]; then
     # Run tar to start the process
     # It'll interactively ask the user to switch tapes (insert next tape...)
     # when creating a multi-volume archive.
+    DEBUG "tar ${args[@]}"
     tar "${args[@]}"
     if (( $? || ${PIPESTATUS[0]} )); then
         echo "ERROR - failed to write archive; possibly incomplete: $TAR_FILE" >&2
