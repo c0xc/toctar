@@ -71,14 +71,106 @@ CWD=${PWD:-.}
 
 ################################################################################
 
+HELP=$(cat <<"EOF"
+TOCTAR - tape backup tool with index and checksums
+
+USAGE:
+
+    toctar COMMAND [-f FILE] ARGS...
+    toctar create --multi-volume --exclude Media/.snapshot -C /data Media Temp
+
+Commands are:
+
+    create
+        Create a new backup archive (like tar -c).
+
+    list
+        Print a list of all files in the archive.
+
+    verify
+        Read all files in the archive and verify their checksums.
+
+    toc
+        Extract the table of contents from the archive and print it out.
+
+    detect-tape-files
+        Scan the tape (each tape file) for existing archives.
+
+    compare
+        Compare a local (base) directory with the contents of the archive
+        to find out which files differ.
+
+    extract
+        Extract the archive (like tar -x).
+        Like tar, this will overwrite existing files,
+        so choose your destination carefully.
+
+Arguments and options are:
+
+    -f FILE
+    Select tape device or file. By default, the first tape device will be used.
+
+    -i|--index INDEX
+    Select tape file index (0 is the first tape file). May be used to
+    explicitly specify the position on the tape.
+    For example, create -i 2 will overwrite the third tape file
+    with a new archive.
+    By default, the first tape file is used.
+
+    --auto-append [create]
+    Try to identify existing archives on the tape and automatically
+    select an index pointing to the tape file after the last archive.
+    May be used to safely append a new archive, keeping the old one(s).
+    See also -i INDEX to specify that index manually.
+    Use detect-tape-files to find out which index would be selected.
+
+    --no-auto-append [create]
+    Disable automatic index (tape file) selection.
+    This is the default.
+
+    --multi-volume
+    Work with a multi-volume archive.
+    Ask for the next tape after the first one and so on.
+    Without this option, you won't be asked to change the tape.
+
+    -C|--directory BASE [create]
+    Specify base directory (like tar -C).
+    Can be used to keep the directory structure within the archive clean.
+    For example, if your storage volumes/filesystems are mounted under /data,
+    use -C /data X to add /data/X/ to the archive.
+
+    --exclude PATH [create]
+    Exclude PATH. Must be relative to the archive. Must not end with a slash.
+    For example, if you've created an archive of the directory X
+    (as specified in the create command), you could exclude the ".snapshot"
+    directory within X like this: --exclude X/.snapshot
+
+    --no-check-existing [create]
+    Don't check for an existing archive before (over)writing.
+
+
+...
+
+EOF
+)
+
+# Command/option: help
+function help {
+    echo "$HELP"
+}
+
+################################################################################
+
 # Command argument
 if [ $# -eq 0 ]; then
     echo "Command argument missing" >&2
+    help
     exit 1
 fi
 case "$1" in
     -h|help)
-        echo you need help
+        help
+        exit
         ;;
     -*)
         echo "Command argument missing (options must follow command)" >&2
@@ -92,6 +184,7 @@ shift
 
 # Options and arguments
 IS_DEBUG=0
+IS_QUIET=0
 IS_TAPE=0
 KEEP_TEMP_DIR=0
 TAR_FILE=
@@ -106,6 +199,9 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         -v|--debug)
             IS_DEBUG=1
+            ;;
+        -q|--quiet)
+            IS_QUIET=1
             ;;
         -f|--archive)
             TAR_FILE=$2
@@ -200,6 +296,7 @@ function DEBUG {
 
 # Decides which file/device to use
 # TODO I cannot decide how to make this decision lol
+# TODO make this a bit more flexible and optional
 function set_device {
     # Tape defaults
     local drive_index=0
@@ -456,6 +553,22 @@ function create_toc_file {
 
         while IFS= read -r file; do
             # again, path is the full path, file is relative to tar
+
+            # Skip (inc)luded file if (exc)luded
+            local exc inc is_excluded
+            inc="$file"
+            is_excluded=0
+            for i in ${!EXCLUDE[@]}; do
+                exc="${EXCLUDE[i]}"
+                if [[ "$inc" =~ ^"$exc"(/|$) ]]; then
+                    DEBUG "SKIP: $file"
+                    is_excluded=1
+                fi
+            done
+            if (( $is_excluded )); then
+                continue
+            fi
+
             # Prepend base path (if specified)
             if [[ -n "$cwd_now" && "$item" =~ ^[^/] ]]; then
                 path="$cwd_now/$file"
@@ -467,23 +580,8 @@ function create_toc_file {
                 echo "ERROR - failed to resolve path: $path ($file)" >&2
                 return 2
             fi
-
-            # Skip (inc)luded file if (exc)luded
-            local exc inc is_excluded
-            inc="$file"
-            is_excluded=0
-            for i in ${!EXCLUDE[@]}; do
-                exc="${EXCLUDE[i]}"
-                if [[ "$inc" =~ ^"$exc"(/|$) ]]; then
-                    DEBUG "SKIP: $path"
-                    is_excluded=1
-                fi
-            done
-            if (( $is_excluded )); then
-                continue
-            fi
-
             echo "$path ..."
+
             # Metadata
             local size mtime hash
             size=$(file_size "$path")
@@ -1194,74 +1292,10 @@ function first_tape {
 
 ################################################################################
 
-function detect_tape_files {
-    # This is essentially a copy of the count_toctar_archives() function.
-    # If this wasn't a cheap bash script, I wouldn't do this.
-    # But it is. So here's some code duplication.
-
-    # Get block size
-    local bs=$TAPE_BS_B
-    # TODO detect_bs_once yadda
-
-    # Temp file
-    local tmp_file=$(tmp_file)
-
-    # Count and detect archives until the (logical) end (like 2 filemarks)
-    local dd_out
-    local err_out rc
-    local count=0
-    while :; do
-        # Rewind tape / go to beginning of tape file
-        rewind "$count" 2>/dev/null 1>&2 || break
-
-        # Read (beginning)
-        echo -n "[$count] ... "
-        echo -n >"$tmp_file"
-        dd_out=$(dd bs=$bs count=1 if="$TAR_FILE" of="$tmp_file" 2>&1)
-        if [[ $? -ne 0 ]]; then
-            # Failed to read tape file, done
-            echo "READ ERROR" >&2
-            echo "$dd_out" >&2
-            return 1
-        fi
-
-        # Stop if no data read
-        if [[ $(file_size "$tmp_file") -eq 0 ]]; then
-            echo "EOF / NO DATA READ"
-            break
-        fi
-
-        # Check for TOCTAR archive (beginning / first tape only)
-        err_out=$(is_toctar_block "$tmp_file" 2>&1); rc=$?
-        if [[ $rc -eq 0 ]]; then
-            echo "TOCTAR ARCHIVE DETECTED!"
-            ((count++))
-            continue
-        fi
-
-        # Check for TAR archive
-        err_out=$(is_tar_block "$tmp_file" 2>&1); rc=$?
-        if [[ $rc -eq 0 ]]; then
-            echo "NO TOCTAR HEADER, BUT TAR ARCHIVE DETECTED!"
-            ((count++))
-            continue
-        else
-            echo "FILE CONTENT NOT RECOGNIZED!"
-            echo "$err_out" >&2
-            break
-        fi
-    done
-    echo "TAPE FILES FOUND: $count"
-
-}
-
-# Most info, warn and debug messages are sent to stderr by default.
-# That way, this extra output can be turned off
-# and it won't be mixed with content/data, which is written to stdout.
-# As usual, a return code of zero indicates success, anything else is an error.
-
-# Command
-if [[ $cmd == "create" || $cmd == "append" ]]; then
+# Command: create
+# TODO clean up, args, local item toc_file ...
+# TODO s/exit/return/g
+function create_archive {
     # Create tar backup
     # Run pre-checks, check for tape (and if first MB empty?), create tarball
     # Create 100 MB sparse file as first file to be used as TOC
@@ -1404,6 +1438,83 @@ if [[ $cmd == "create" || $cmd == "append" ]]; then
     #        $MT -f "$TAR_FILE" eof || exit $?
     #    fi
     #fi
+
+}
+
+# Command: detect-tape-files
+function detect_tape_files {
+    # This is essentially a copy of the count_toctar_archives() function.
+    # If this wasn't a cheap bash script, I wouldn't do this.
+    # But it is. So here's some code duplication.
+
+    # Get block size
+    local bs=$TAPE_BS_B
+    # TODO detect_bs_once yadda
+
+    # Temp file
+    local tmp_file=$(tmp_file)
+
+    # Count and detect archives until the (logical) end (like 2 filemarks)
+    local dd_out
+    local err_out rc
+    local count=0
+    while :; do
+        # Rewind tape / go to beginning of tape file
+        rewind "$count" 2>/dev/null 1>&2 || break
+
+        # Read (beginning)
+        echo -n "[$count] ... "
+        echo -n >"$tmp_file"
+        dd_out=$(dd bs=$bs count=1 if="$TAR_FILE" of="$tmp_file" 2>&1)
+        if [[ $? -ne 0 ]]; then
+            # Failed to read tape file, done
+            echo "READ ERROR" >&2
+            echo "$dd_out" >&2
+            return 1
+        fi
+
+        # Stop if no data read
+        if [[ $(file_size "$tmp_file") -eq 0 ]]; then
+            echo "EOF / NO DATA READ"
+            break
+        fi
+
+        # Check for TOCTAR archive (beginning / first tape only)
+        err_out=$(is_toctar_block "$tmp_file" 2>&1); rc=$?
+        if [[ $rc -eq 0 ]]; then
+            echo "TOCTAR ARCHIVE DETECTED!"
+            ((count++))
+            continue
+        fi
+
+        # Check for TAR archive
+        err_out=$(is_tar_block "$tmp_file" 2>&1); rc=$?
+        if [[ $rc -eq 0 ]]; then
+            echo "NO TOCTAR HEADER, BUT TAR ARCHIVE DETECTED!"
+            ((count++))
+            continue
+        else
+            echo "FILE CONTENT NOT RECOGNIZED!"
+            echo "$err_out" >&2
+            break
+        fi
+    done
+    echo "TAPE FILES FOUND: $count"
+
+}
+
+# Most info, warn and debug messages are sent to stderr by default.
+# That way, this extra output can be turned off
+# and it won't be mixed with content/data, which is written to stdout.
+# As usual, a return code of zero indicates success, anything else is an error.
+
+# Command
+if [[ $cmd == "help" ]]; then
+    echo "$HELP"
+
+elif [[ $cmd == "create" || $cmd == "append" ]]; then
+    # Create backup archive
+    create_archive "$@"
 
 elif [[ $cmd == "toc" ]]; then
     # Extract and print TOC
