@@ -5,7 +5,6 @@ set +o histexpand
 # TAPE BACKUP TOOL - TOCTAR
 
 # TODO find mt-st
-# TODO IS_TAPE vs USE_TAPE
 # TODO IS_MULTI vs NO_MULTI
 # TODO nst0 (tape drive index) + rewind/asf rather than st0 // compression
 # TODO pass -C thru and put everything in subdir DATA/
@@ -79,7 +78,7 @@ USAGE:
     toctar COMMAND [-f FILE] ARGS...
     toctar create --multi-volume --exclude Media/.snapshot -C /data Media Temp
 
-Commands are:
+COMMANDS:
 
     create
         Create a new backup archive (like tar -c).
@@ -89,6 +88,7 @@ Commands are:
 
     verify
         Read all files in the archive and verify their checksums.
+        Use the --quiet option to print errors only.
 
     toc
         Extract the table of contents from the archive and print it out.
@@ -105,7 +105,7 @@ Commands are:
         Like tar, this will overwrite existing files,
         so choose your destination carefully.
 
-Arguments and options are:
+ARGUMENTS AND OPTIONS:
 
     -f FILE
     Select tape device or file. By default, the first tape device will be used.
@@ -148,8 +148,19 @@ Arguments and options are:
     --no-check-existing [create]
     Don't check for an existing archive before (over)writing.
 
+    -v|--verbose
+    Be verbose (more output).
 
-...
+    -q|--quiet
+    Be quiet (less output).
+
+
+
+AUTHOR:
+
+Philip <philip@c0xc.net>
+
+
 
 EOF
 )
@@ -189,7 +200,7 @@ IS_TAPE=0
 KEEP_TEMP_DIR=0
 TAR_FILE=
 IS_AUTO_APPEND=0
-IS_MULTI=0 # TODO
+IS_MULTI=0
 ITEMS=()
 EXCLUDE=()
 REL_DIRS=()
@@ -1118,7 +1129,9 @@ function gen_script {
     }
 
     # Env settings
-    my $print_hash = $ENV{PRINT_HASH};
+    my $verbose = "%VERBOSE%";
+    my $quiet = "%QUIET%";
+    my $print_hash = $verbose;
 
     # Read TOC file (map)
     # If a later/newer TOC section contains an old file again,
@@ -1187,7 +1200,6 @@ function gen_script {
     my $md5 = Digest::MD5->new;
     my $sha256 = Digest::SHA->new(256);
     my $out_fh;
-    print STDERR "$tar_realname ... ";
 
     # Read tar contents
     my $bs = 1024*512; # 1024*512
@@ -1204,20 +1216,24 @@ function gen_script {
     }
     my $hash;
     $hash = $sha256->hexdigest;
-    if ($print_hash) {
-        print STDERR "$hash ";
-    }
-    print STDERR "=> ";
 
-    # TODO get TOC (tmp file) and compare hash sum
+    # Prepare output line
+    my $line = "$tar_realname ... ";
+    if ($print_hash) {
+        $line .= "$hash ";
+    }
+    $line .= "=> ";
+
     # Check if calculated hash matches hash in TOC
     my $continue_error;
     my $hash_match = $toc->{hash} eq $hash;
     if ($hash_match) {
-        print STDERR "VERIFIED OK\n";
+        $line .= "VERIFIED OK\n";
+        print STDERR $line unless $quiet;
     }
     else {
-        print STDERR "MISMATCH!\n";
+        $line .= "MISMATCH!\n";
+        print STDERR $line;
         warn "ERROR: $tar_realname does not match stored checksum!\n";
         warn "File appears to be corrupt\n";
         return 1 unless $continue_error;
@@ -1229,6 +1245,8 @@ END
     # Put path to TOC file in script
     raw=$(echo "$raw" | sed 's!%TOC_FILE%!'"$toc_file!")
     raw=$(echo "$raw" | sed 's!%TMP_DIR%!'"$TMP_DIR!")
+    raw=$(echo "$raw" | sed 's!%VERBOSE%!'"$IS_DEBUG!")
+    raw=$(echo "$raw" | sed 's!%QUIET%!'"$IS_QUIET!")
 
     # Save script
     local file=$(tmp_file)
