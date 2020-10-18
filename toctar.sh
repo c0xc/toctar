@@ -40,14 +40,14 @@ trap cleanup EXIT
 ################################################################################
 
 # Create temporary directory
-#TMP_DIR=$(mktemp -d 2>/dev/null || mktemp -d -t 'toctar.tmp')
 TMP_DIR=$(mktemp -d '/tmp/TOCTAR.XXXXXXXXXX')
 if [[ $? -ne 0 ]]; then
     echo "ERROR - failed to create temporary directory" >&2
     exit 3
 fi
 
-# TOC size 128 MB
+# TOC default size 128 MB
+# A larger TOC will have a multiple of that size.
 TOC_FIX_SIZE=$((1024**2*128))
 
 # Tape block size: 512 KB (by default)
@@ -465,7 +465,7 @@ function count_toctar_archives {
 
         # Try to detect TOCTAR archive
         # Only the beginning of the archive can be detected (first tape)
-        err_out=$(is_toctar_block "$tmp_file" 2>&1); rc=$?
+        err_out=$(is_toctar_header "$tmp_file" 2>&1); rc=$?
         if [[ $rc -eq 0 ]]; then
             # DEBUG "TOCTAR ARCHIVE DETECTED!"
             ((count++))
@@ -503,7 +503,7 @@ function count_toctar_archives {
 # TOC file creator
 # Takes a temp file path as argument
 # Writes TOC to file (by appending if old TOC provided)
-# Final TOC file is zero-padded to use up fixed TOC size
+# Final TOC file is zero-padded to use up fixed TOC size (or a multiple)
 function create_toc_file {
     local toc_file=$1
 
@@ -625,21 +625,38 @@ function create_toc_file {
     entry=$'\n'"#!TOC @$ts @$ts2"$'\n'
     echo "$entry" >>"$toc_file"
     if (( $? || ${PIPESTATUS[0]} )); then
-        echo "ERROR - failed to write to TOC file" >&2
+        echo "ERROR - failed to write TOC file" >&2
         return 2
     fi
 
     # Expand TOC file to fixed TOC size (128 MB) by zero-padding
-    # That way, it can be extended later
+    # If the default TOC size isn't enough, it'll be extended
+    # by TOC blocks of TOC_FIX_SIZE.
+    local toc_size toc_blocks toc_diff new_toc_size
     toc_size=$(file_size "$toc_file")
     if [[ $toc_size -gt $TOC_FIX_SIZE ]]; then
-        echo "ERROR - TOC too big ($toc_size B)" >&2
-        return 2
+        # TOC too big... calculate bigger TOC area
+        toc_blocks=$((toc_size/TOC_FIX_SIZE))
+        if [[ $((toc_size%TOC_FIX_SIZE)) -ne 0 ]]; then
+            toc_blocks=$((toc_blocks+1))
+        fi
+        new_toc_size=$((toc_blocks*TOC_FIX_SIZE))
+        echo "extended TOC area ($new_toc_size B)" >&2
+        toc_diff=$((toc_blocks*TOC_FIX_SIZE-toc_size))
+    else
+        # Calculate unused space of TOC block (128 MB)
+        new_toc_size=$((TOC_FIX_SIZE))
+        toc_diff=$(($TOC_FIX_SIZE-$toc_size))
     fi
-    toc_diff=$(($TOC_FIX_SIZE-$toc_size))
+    # Grow toc file to calculated size
     cat >>"$toc_file" < <(head -c "$toc_diff" </dev/zero)
     if (( $? || ${PIPESTATUS[0]} )); then
         echo "ERROR - failed to fill TOC file (+ $toc_diff B)" >&2
+        return 2
+    fi
+    # Double-check size
+    if [[ $(file_size "$toc_file") -ne $new_toc_size ]]; then
+        echo "ERROR - failed to grow TOC file ($new_toc_size B)" >&2
         return 2
     fi
 
@@ -694,7 +711,7 @@ function detect_block_size {
 
     # TODO repeat if 0 / error...
 
-    # Calculate numer of blocks to be read
+    # Calculate number of blocks to be read
     # Then read full TOC to double-check that all TOC blocks have the same bs
     # Now reading with previously detected "real" block size
     local full_size count i
@@ -757,16 +774,27 @@ function is_tar_block {
     fi
 
     # Extract "ustar" magic header
+    # https://www.gnu.org/software/tar/manual/html_node/Standard.html
+    # OLDGNU_MAGIC "ustar  "  /* 7 chars and a null */
+    # TMAGIC   "ustar"        /* ustar and a null */
+    # We'll make use of the terminating null byte by also extracting it (8)
+    # and then counting a length of 7 because Bash isn't counting the null.
+    # Why am I writing this in Bash?
     local extracted
-    extracted=$(dd if="$tmp_file" skip=257 bs=1 count=7)
+    extracted=$(dd if="$tmp_file" skip=257 bs=1 count=8)
     if [[ $? -ne 0 ]]; then
         echo "ERROR - NO INPUT DATA OR BLOCK TOO SMALL" >&2
         return 1
     fi
 
-    # Check what we've got
-    if [[ "$(echo "$extracted")" == "ustar  " ]]; then
-        # Found tar header
+    # Check for ustar header and extracted size - 1 because of \0
+    # If we had just extracted 8 ascii bytes starting, the extracted
+    # length would be 8 but it's 7 because the 8th byte is a null.
+    if [[ ${#extracted} -eq 7 && "$extracted" == "ustar  " ]]; then
+        # Found tar header: "ustar" followed by 2 whitespaces and a null
+        return 0
+    elif [[ ${#extracted} -eq 5 && "$extracted" == "ustar" ]]; then
+        # Found tar header: "ustar" and a null
         return 0
     else
         echo "NO TAR HEADER FOUND" >&2
@@ -778,7 +806,7 @@ function is_tar_block {
 # Reads the next block and checks if it gets a TOCTAR header.
 # If yes, the tape file that we've read contains a TOCTAR archive.
 # TODO clean up code duplication ...
-function is_toctar_block {
+function is_toctar_header {
     local input_file=$1
     local tmp_file=$2
 
@@ -826,7 +854,7 @@ function is_toctar_block {
     fi
 
     # Check what we've got
-    if [[ "$(echo "$extracted" | head -c 5)" == "# TOC" ]]; then
+    if [[ "${extracted:0:5}" == "# TOC" ]]; then
         # Found TOCTAR header
         return 0
     else
@@ -841,7 +869,7 @@ function is_toctar_block {
 # May use a temporary file as buffer (can be specified in second argument)
 function extract_toc_file {
     local toc_file=$1 # target temporary file or blank for stdout
-    local tmp_file=$2
+    local tmp_file=$2 # special meaning (obsolete), see replace_toc
 
     # Temp file
     if [ -z "$tmp_file" ]; then
@@ -877,11 +905,8 @@ function extract_toc_file {
         rewind || return $?
     fi
 
-    # Extract TOC to file (or stdout)
+    # Extract TOC block to temporary file
     # Use detected tape block size or default and calculate number of blocks
-    local in_min=$((TOC_FIX_SIZE+512))
-    local in_count=$((in_min/bs+1))
-    local toc_count=$((TOC_FIX_SIZE/512))
     if [[ -n "$toc_file" && "$toc_file" != "-" ]]; then
         # Write extracted TOC to $toc_file
         # bs - block size used for reading (detected or default)
@@ -896,47 +921,107 @@ function extract_toc_file {
             echo "ERROR - failed to create temporary TOC file $toc_file" >&2
             return 2
         fi
+        local tmp_file2=$(tmp_file) || return 1
 
-        # Read section containing TOC (verbatim)
         # This wouldn't work with different sized blocks on tape:
         # dd ibs=512 skip=1 count="$count" if="$TAR_FILE" of="$toc_file" || return $?
         # This'll return < count*bs if the tape blocks are smaller.
         # Default tar tape blocks are 20*512 = 10K.
         # There's iflag=fullblock, but it doesn't help with the count thing.
         # Anyway... First, we'll read a bit more than we need.
-        local dd_out
-        dd_out=$(dd ibs=$bs count=$in_count if="$TAR_FILE" of="$tmp_file" 2>&1)
-        if [[ $? -ne 0 ]]; then
-            echo "$dd_out" >&2
-            return 1
-        fi
+        local in_min=$((TOC_FIX_SIZE+512+512))
+        local in_count=$((in_min/bs+1))
+        local toc_count=$((TOC_FIX_SIZE/512))
 
+        # Read section containing TOC from tape (verbatim)
+        # We are reading the first file in the archive, which contains the TOC.
+        local in_offset=0
+        local dd_out in_skip in_off
+        for ((in_skip=0; 1; in_skip++)); do
+            # Extract toc block size + puffer, rounded to blocks
+            dd_out=$(dd ibs=$bs count=$in_count skip=$in_skip if="$TAR_FILE" \
+                of="$tmp_file" oflag=append conv=notrunc 2>&1)
+            # If the default toc size is increased (never do that)
+            # and a toctar file with a smaller toc size is read,
+            # the end of the toc is never found.
+            # In the process, the whole archive is written to a temp file,
+            # which could lead to:
+            # dd: writing to '/tmp/TOCTAR.I17yKX0XNm/.TARTOC.mdlxZnpK3C': No space left on device
+            # The temp file is deleted automatically by default.
+            if [[ $? -ne 0 ]]; then
+                echo "$dd_out" >&2
+                echo "ERROR - failed to extract (ibs=$bs count=$in_count skip=$in_skip of=$tmp_file)" >&2
+                truncate -s 0 "$tmp_file" # remove huge temp file to allow the program to continue
+                return 1
+            fi
+            toc_count=$((((in_skip+1)*TOC_FIX_SIZE)/512)) # used for next copy
+
+            # Check and warn if the temp file is growing huge
+            # This may not seem like a very clever approach but it's past 3am.
+            # TODO improve, optimize, think?
+            if [[ $(file_size $tmp_file) -gt $((1024**3*1)) ]]; then
+                echo "WARN - read more than a GB (temp file) and still looking for the end of the TOC, strange" >&2
+                echo "WARN - is this a TOCTAR file? Hit Ctrl+C if you're suspicious or low on /tmp space" >&2
+            fi
+            if [[ $(file_size $tmp_file) -gt $((1024**3*5)) ]]; then
+                echo "ERROR - read several GB but couldn't find the end of the TOC, call the helpdesk" >&2
+                truncate -s 0 "$tmp_file" # remove huge temp file to allow the program to continue
+                return 1
+            fi
+
+            # Check for tar header after current toc block
+            in_off=$((512+(in_skip+1)*TOC_FIX_SIZE))
+            dd_out=$(dd ibs=1 skip=$in_off count=512 if="$tmp_file" of="$tmp_file2" 2>&1)
+            if [[ $? -ne 0 ]]; then
+                echo "$dd_out" >&2
+                echo "ERROR - failed to copy temp block (ibs=1 skip=$in_off count=512 if=$tmp_file of=$tmp_file2)" >&2
+                truncate -s 0 "$tmp_file" # remove huge temp file to allow the program to continue
+                return 1
+            fi
+            if [[ $(file_size "$tmp_file2") -eq 0 ]]; then
+                echo "ERROR - end of TOC not found before reaching end of file" >&2
+                truncate -s 0 "$tmp_file" # remove huge temp file to allow the program to continue
+                return 1
+                break # in case I remove the return statement
+            fi
+            if is_tar_block "$tmp_file2" 2>/dev/null; then
+                # Found tar block of next file
+                truncate -s $in_off "$tmp_file"
+                if [[ $? -ne 0 ]]; then
+                    echo "$dd_out" >&2
+                    echo "ERROR - failed to truncate temp file to $in_off B" >&2
+                    return 1
+                fi
+                break
+            fi
+            # rinse and repeat ...
+
+        done
         # Now copy TOC from temporary file to target file
+        # count="$toc_count" is actually optional since we've already truncated
         dd_out=$(dd ibs=512 skip=1 count="$toc_count" if="$tmp_file" of="$toc_file" 2>&1)
         if [[ $? -ne 0 ]]; then
             echo "$dd_out" >&2
+            echo "ERROR - failed to copy temp file (if=$tmp_file of=$toc_file)" >&2
             return 1
         fi
 
+        # The official way to do it:
+        # tar --extract --to-stdout --occurrence -f "$TAR_FILE" .TARTOC >"$toc_file" 2>/dev/null
+
         # Double-check size (if < count*bs)
         local read_bytes=$(file_size "$toc_file")
-        if [[ $read_bytes -ne $TOC_FIX_SIZE ]]; then
-            # TODO print tape status for debugging
-            tape_status_number
+        if [[ $read_bytes -lt $TOC_FIX_SIZE ]]; then
+            # Read toc area smaller than TOC_FIX_SIZE, i.e., incomplete
+            tape_status_number >&2
+            echo "ERROR - failed to read TOC (read $read_bytes)" >&2
+            return 2
+        elif [[ $((read_bytes%$TOC_FIX_SIZE)) -ne 0 ]]; then
+            # Read toc area not a multiple of TOC_FIX_SIZE, i.e., incomplete
+            tape_status_number >&2
             echo "ERROR - failed to read TOC (read $read_bytes)" >&2
             return 2
         fi
-
-        # Here's another piece of code that I've written twice
-        # local full_size count i dd_out
-        # full_size=$((512+TOC_FIX_SIZE))
-        # count=$((full_size/read_bs+1))
-        # dd_out=$(dd bs="$bs" count=1 if="$TAR_FILE" of="/dev/null" 2>&1)
-        # for ((i=0; i<count; i++)); do
-        #     dd_out=$(dd bs="$bs" count=1 oflag=notrunc if="$TAR_FILE" of="/dev/null" 2>&1)
-        #     dd_line=$(echo "$dd_out" | grep -E '^[0-9]+ bytes.*copied') || return $?
-        #     read_b_dd=$(echo "$dd_line" | grep -Eo '^[0-9]+') || return $?
-        # ...
 
         # Verify that we've extracted a TOC by checking beginning
         # TODO implement better verify routine
@@ -945,13 +1030,10 @@ function extract_toc_file {
             return 2
         fi
     else
-        # Read first block, check it and print it, then read/print the rest
-        # TODO this is totally untested
-        # TODO EXPERIMENTAL, DON'T DO THIS, UNFINISHED, I HAVEN'T REALLY THOUGHT THIS THROUGH
-        echo "EXPERIMENTAL"
-        return 1
-
-        # TODO read in loop, check dd_out, this is going to be great
+        # Read TOC and print it to stdout
+        # No verification is perfomed to check if we are actually reading a TOC
+        # or if we are reading some bad file.
+        tar --extract --to-stdout --occurrence -f "$TAR_FILE" .TARTOC 2>/dev/null
 
     fi
 }
@@ -975,8 +1057,9 @@ function replace_toc {
     # To read a short story about block sizes, see extract_toc_file...
 
     # Double-check input size
+    # TODO TOC size might be a multiple of TOC_FIX_SIZE 
     toc_size=$(file_size "$toc_file")
-    if [[ $toc_size -ne $TOC_FIX_SIZE ]]; then
+    if [[ $toc_size -ne $TOC_FIX_SIZE ]]; then # TODO see note about TOC size
         echo "ERROR - new TOC is ${toc_size}B, must be ${TOC_FIX_SIZE}B" >&2
         return 2
     fi
@@ -1015,7 +1098,6 @@ function replace_toc {
     # but we've just read/extracted that header from the archive,
     # so we're effectively not changing it.
     dd_out=$(dd obs=$bs conv=notrunc if="$tmp_section_file" of="$TAR_FILE" 2>&1)
-echo "tmp_section_file=$tmp_section_file ($dd_out) " >&2
     if [[ $? -ne 0 ]]; then
         echo "$dd_out" >&2
         echo "ERROR - failed to overwrite TOC section - archive may be damaged" >&2
@@ -1348,6 +1430,8 @@ function create_archive {
     fi
 
     # Check for existing archive that would be overwritten
+    # Note that this will take a while and copy the first few GB
+    # to a temp file if the existing file is not a valid toctar archive.
     if (( $CHECK_EXISTING )); then
         # Run extract call in subshell because an error shouldn't be fatal
         tmp_toc_file=$(tmp_file)
@@ -1399,7 +1483,13 @@ function create_archive {
         # This is the crucial part. We are overwriting the first section
         # of the archive to replace it with an extended version.
         # The first tape must be inserted, which is the case, see above.
-        replace_toc "$toc_file" || exit $?
+        if [[ $IS_TAPE -eq 1 ]]; then
+            echo "Appending on tape is not supported. You can create a new tape file though." 2>&2
+            exit 1
+        else
+            # TODO remove this, it doesn't work
+            replace_toc "$toc_file" || exit $?
+        fi
         # Tell Tar to update the archive
         args+=("--append")
 
@@ -1498,7 +1588,7 @@ function detect_tape_files {
         fi
 
         # Check for TOCTAR archive (beginning / first tape only)
-        err_out=$(is_toctar_block "$tmp_file" 2>&1); rc=$?
+        err_out=$(is_toctar_header "$tmp_file" 2>&1); rc=$?
         if [[ $rc -eq 0 ]]; then
             echo "TOCTAR ARCHIVE DETECTED!"
             ((count++))
