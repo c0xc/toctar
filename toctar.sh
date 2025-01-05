@@ -12,7 +12,7 @@ set +o histexpand
 #
 
 # Check dependencies
-# TODO mt
+# mt, mt-st
 MT=mt
 for d in tar mt; do
     if ! type $d &>/dev/null; then
@@ -101,8 +101,14 @@ COMMANDS:
     toc
         Extract the table of contents from the archive and print it out.
 
+    bs
+        Determine the block size (in case the tape was written by another tool.)
+
     detect-tape-files
         Scan the tape (each tape file) for existing archives.
+
+    tape-status
+        Print the type of LTO tape as determined by the driver.
 
     compare
         Compare a local (base) directory with the contents of the archive
@@ -117,6 +123,10 @@ ARGUMENTS AND OPTIONS:
 
     -f FILE
     Select tape device or file. By default, the first tape device will be used.
+	To specify a tape, the -t option should be used instead.
+
+    -t TAPE_INDEX
+    Select tape device by index, set TAPE_INDEX to 1 for the second tape etc.
 
     -i|--index INDEX
     Select tape file index (0 is the first tape file). May be used to
@@ -161,6 +171,32 @@ ARGUMENTS AND OPTIONS:
 
     -q|--quiet
     Be quiet (less output).
+
+EXAMPLES:
+
+	Create TOCTAR archive from specified directory,
+	saved to the tape in the first tape drive (nst0).
+	It will be saved to the first tape file, existing data will be overwritten.
+	(First "tape file" refers to the index of the archive on the tape itself.)
+    toctar create /zbod1/DUMP/test/
+
+	Create multi-volume tape archive of directories Media and Temp,
+	from /data (/data won't be part of the path in the archive).
+	The hidden snapshot directory/mountpoint .snapshot will be excluded.
+    toctar create --multi-volume --exclude Media/.snapshot -C /data Media Temp
+
+	List files in archive on current tape.
+    toctar list
+
+	List files in archive on tape in second drive.
+    toctar list -t 1
+
+	Check type of archive on current tape.
+	This prints the creation time if a valid archive is detected.
+	toctar info
+
+	Detect block size of TOCTAR or regular tar archive.
+	toctar bs
 
 
 
@@ -1001,6 +1037,7 @@ function extract_toc_file {
         local in_count=$((in_min/bs+1))
         local toc_count=$((TOC_FIX_SIZE/512))
 
+		# TODO buggy? prefixed in a45a9c7a341a0cfa759735d646da6aaca6fae5c1
         # Read section containing TOC from tape (verbatim)
         # We are reading the first file in the archive, which contains the TOC.
         local in_offset=0
@@ -1403,6 +1440,22 @@ END
     echo "$file"
 }
 
+function toc_timestamp {
+    local toc_file=$1
+
+	local hline=$(head -n1 <"$toc_file")
+    if [[ "${hline:0:5}" != "# TOC" ]]; then
+		return
+	fi
+
+	local ts=$(echo "$hline" | grep -Eo '@[0-9]+' | tail -c +2)
+	if ! [[ "$ts" =~ ^[0-9]+$ ]]; then
+		return
+	fi
+
+	echo "$ts"
+}
+
 # Read TOC file and extract TOC section lines (without header, footer)
 # TODO if requested, return single section only
 function toc_lines {
@@ -1669,6 +1722,59 @@ function detect_tape_files {
 
 }
 
+# Helper: detect-toc-first-tape-file
+function detect_toc_first_tape_file {
+    # Detect type of first tape file: 0 (TOCTAR), 1 (TAR), 2 (other), 3 (error)
+    # Code duplication, see above
+
+    # Get block size
+    local bs=$TAPE_BS_B
+
+    # Temp file
+    local tmp_file=$(tmp_file)
+
+    # Count and detect archives until the (logical) end (like 2 filemarks)
+    local dd_out
+    local err_out rc
+    local count=0
+	# Rewind tape / go to beginning of tape file
+	rewind "$count" 2>/dev/null 1>&2 || return 3
+
+	# Read (beginning)
+	dd_out=$(dd bs=$bs count=1 if="$TAR_FILE" of="$tmp_file" 2>&1)
+	if [[ $? -ne 0 ]]; then
+		# Failed to read tape file, done
+		echo "READ ERROR" >&2
+		echo "$dd_out" >&2
+		return 3
+	fi
+
+	# Stop if no data read
+	if [[ $(file_size "$tmp_file") -eq 0 ]]; then
+		echo "EOF / NO DATA READ" >&2
+		return 2
+	fi
+
+	# Check for TOCTAR archive (beginning / first tape only)
+	err_out=$(is_toctar_header "$tmp_file" 2>&1); rc=$?
+	if [[ $rc -eq 0 ]]; then
+		# echo "TOCTAR ARCHIVE DETECTED!"
+		return 0
+	fi
+
+	# Check for TAR archive
+	err_out=$(is_tar_block "$tmp_file" 2>&1); rc=$?
+	if [[ $rc -eq 0 ]]; then
+		# echo "NO TOCTAR HEADER, BUT TAR ARCHIVE DETECTED!"
+		return 1
+	else
+		# echo "FILE CONTENT NOT RECOGNIZED!"
+		return 2
+		echo "$err_out" >&2
+	fi
+	return 3
+}
+
 # Most info, warn and debug messages are sent to stderr by default.
 # That way, this extra output can be turned off
 # and it won't be mixed with content/data, which is written to stdout.
@@ -1704,6 +1810,9 @@ elif [[ $cmd == "detect" ]]; then
     if [[ $IS_MULTI -eq 1 ]]; then
         ask "Please insert the [first] drive" || exit $?
     fi
+
+	# TODO DO NOT USE, THIS IS BUGGY
+	# WARN - read more than a GB (temp file) and still looking for the end of the TOC, strange
 
     # Try to read TOC
     # If it fails (TOC area does not contain TOC), it's not a TOCTAR archive
@@ -1798,6 +1907,43 @@ elif [[ $cmd == "extract" ]]; then
     # ...
     :
     # TODO test
+
+elif [[ $cmd == "tape-status" ]]; then
+	mt_type=$($MT -f "$TAR_FILE" status | grep LTO | grep -Eo 'LTO-[0-9]')
+	if [[ -z "$mt_type" ]]; then
+		mt_type="?"
+	fi
+    echo "### TAPE TYPE: ${mt_type}"
+
+elif [[ $cmd == "info" ]]; then
+	# Read TOC, print creation date/time
+
+	is_toc=$(detect_toc_first_tape_file); is_toc=$?
+	if [[ $is_toc = 0 ]]; then
+		echo "TOCTAR archive found"
+	elif [[ $is_toc = 1 ]]; then
+		echo "NOT A TOCTAR ARCHIVE, but TAR archive detected"
+		exit
+	elif [[ $is_toc = 2 ]]; then
+		echo "NO ARCHIVE FILE DETECTED ON TAPE"
+		exit
+	elif [[ $is_toc = 3 ]]; then
+		echo "READ ERROR"
+		exit
+	fi
+
+    old_toc_file="$TMP_DIR/.TARTOC.OLD"
+    extract_toc_file "$old_toc_file" || exit $?
+    sed -i 's/\x00\+$//' "$old_toc_file" || exit $?
+	toc=$(cat "$old_toc_file")
+	toc_ts=$(toc_timestamp "$old_toc_file")
+	if [[ -z "$toc_ts" ]]; then
+        echo "### FAILED TO READ TOC." >&2
+        exit 1
+	fi
+
+	toc_datetime=$(date --date "@$toc_ts")
+	echo "TOCTAR archive created: $toc_datetime"
 
 fi
 
