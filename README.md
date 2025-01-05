@@ -20,6 +20,66 @@ this checksum validation would tell you.
 
 
 
+Example
+-------
+
+Create TOCTAR archive of a directory:
+
+    $ toctar create /zbod1/DUMP/test/2rand/
+    # Using default tape device: /dev/nst0
+    ### CREATING TARBALL BACKUP => nst0...
+    ### THIS WILL OVERWRITE THE TAPE ARCHIVE AT /dev/nst0 [#0] ...
+    ## CREATING TOC / SCANNING FILES...
+    ...
+    .TARTOC
+    tar: Removing leading `/' from member names
+    /zbod1/DUMP/test/2rand/
+    /zbod1/DUMP/test/2rand/randrw.4.0
+    tar: Removing leading `/' from hard link targets
+    /zbod1/DUMP/test/2rand/randrw.5.0
+    /zbod1/DUMP/test/2rand/randrw.1.0 blank
+    /zbod1/DUMP/test/2rand/randrw.7.0
+    /zbod1/DUMP/test/2rand/randrw.6.0
+    /zbod1/DUMP/test/2rand/randrw.2.0
+    /zbod1/DUMP/test/2rand/randrw.3.0
+    /zbod1/DUMP/test/2rand/randrw.0.0
+
+Without -t option, the tape in the first drive is used.
+
+Detect archive on current tape:
+
+    $ toctar info
+    # Using default tape device: /dev/nst0
+    TOCTAR archive found
+    TOCTAR archive created: Sun Jan  5 01:36:06 PM CET 2025
+
+List files from tape:
+
+    $ toctar list
+    # Using default tape device: /dev/nst0
+    /zbod1/DUMP/test/2rand/randrw.4.0
+    /zbod1/DUMP/test/2rand/randrw.5.0
+    /zbod1/DUMP/test/2rand/randrw.1.0 blank
+    /zbod1/DUMP/test/2rand/randrw.7.0
+    /zbod1/DUMP/test/2rand/randrw.6.0
+    /zbod1/DUMP/test/2rand/randrw.2.0
+    /zbod1/DUMP/test/2rand/randrw.3.0
+    /zbod1/DUMP/test/2rand/randrw.0.0
+
+Manually write classic tar archive, fast forward, find the tape, insert it and
+detect the archive on current tape:
+
+    $ mt-st -f /dev/nst0 rewind
+    $ tar cvf /dev/nst0 /zbod1/DUMP/test/2rand/randrw.2.0
+    tar: Removing leading `/' from member names
+    /zbod1/DUMP/test/2rand/randrw.2.0
+
+    $ toctar info
+    # Using default tape device: /dev/nst0
+    NOT A TOCTAR ARCHIVE, but TAR archive detected
+
+
+
 Installation
 ------------
 
